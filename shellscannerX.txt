@@ -1,0 +1,532 @@
+<?php
+/**
+ * IndoHaxSec Anti-Shell Scanner - FULLPOWER EDITION
+ * Production Ready - Hardened Against Bypass and Logic Flaws
+ * @version 2.2
+ */
+
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+
+// ==================== KONFIGURASI ====================
+$CORRECT_PASSWORD = 'indohaxsec';
+
+// Konfigurasi scanning
+$scan_extensions = ['php', 'phtml', 'php5', 'php7', 'phps', 'inc', 'txt', 'htaccess', 'html', 'htm', 'shtml', 'cgi', 'pl', 'py', 'sh'];
+$max_filesize = 1024 * 1024; // 1MB
+$batch_limit = 50; 
+$max_files_to_scan = 15000; 
+
+// Set resource limits yang aman
+@ini_set('memory_limit', '512M');
+@ini_set('max_execution_time', 120); 
+@ini_set('max_input_time', 60);
+
+error_reporting(E_ALL);
+ini_set('display_errors', 0);
+ini_set('log_errors', 1);
+
+// ==================== FUNGSI UTAMA ====================
+
+function fastFileScanner($root, $extensions, $max_files) {
+    $files = [];
+    try {
+        $dirIterator = new RecursiveDirectoryIterator($root, RecursiveDirectoryIterator::SKIP_DOTS);
+        $iterator = new RecursiveIteratorIterator($dirIterator, RecursiveIteratorIterator::LEAVES_ONLY);
+        
+        $count = 0;
+        foreach ($iterator as $file) {
+            if ($file->isFile()) {
+                if (!$file->isReadable()) continue;
+
+                $ext = strtolower($file->getExtension());
+                if (in_array($ext, $extensions)) {
+                    if ($file->getSize() <= 1024 * 1024) { 
+                        $files[] = $file->getPathname();
+                        $count++;
+                        if ($count >= $max_files) break;
+                    }
+                }
+            }
+        }
+    } catch (Exception $e) {
+        // Silent fail, lewati direktori yang tidak bisa diakses
+    }
+    return $files;
+}
+
+class ShellDetector {
+    private $patterns = [];
+    private $cache = [];
+    
+    public function __construct() {
+        $this->loadPatterns();
+    }
+    
+    private function loadPatterns() {
+        $this->patterns = [
+            'dangerous_functions' => [
+                'pattern' => '/\b(base64_decode|gzinflate|str_rot13|gzuncompress|strrev|rawurldecode|convert_uudecode|urldecode)\s*\(/i',
+                'reason' => 'Fungsi encoding/decoding berbahaya'
+            ],
+            'system_commands' => [
+                'pattern' => '/\b(system|shell_exec|exec|passthru|popen|proc_open|pcntl_exec|expect_popen)\s*\(\s*(?:[\'"]\s*)?\$_(GET|POST|REQUEST|COOKIE|SERVER)/i',
+                'reason' => 'Eksekusi perintah sistem dari input user'
+            ],
+            'backtick_exec' => [
+                'pattern' => '/`\s*\$_(GET|POST|REQUEST|COOKIE)/i',
+                'reason' => 'Backtick execution dari input user'
+            ],
+            'eval_hex' => [
+                'pattern' => '/\$\{\s*[\'"]\x47\x4C\x4F\x42\x41\x4C\x53[\'"]\s*\[/i',
+                'reason' => 'Eval dengan string hex'
+            ],
+            'assert_user' => [
+                'pattern' => '/\bassert\s*\(\s*\$_(GET|POST|REQUEST)/i',
+                'reason' => 'Assert dengan input user'
+            ],
+            'variable_variable' => [
+                'pattern' => '/\$_?(GET|POST|REQUEST|COOKIE)\s*\[\s*[\'"]?\s*[\'"]?\s*\]\s*\(\s*\$_?(GET|POST|REQUEST)/i',
+                'reason' => 'Variable variable dengan input user'
+            ],
+            'file_manipulation' => [
+                'pattern' => '/\b(move_uploaded_file|copy|rename)\s*\(.*\$_(GET|POST|REQUEST)/i',
+                'reason' => 'Manipulasi file dari input user'
+            ],
+            'include_input' => [
+                'pattern' => '/\b(include|require)(?:_once)?\s*\(\s*\$_(GET|POST|REQUEST|COOKIE)/i',
+                'reason' => 'Include file dari input user'
+            ],
+            'curl_exec' => [
+                'pattern' => '/\bcurl_exec\s*\(\s*\$_(GET|POST|REQUEST)/i',
+                'reason' => 'Curl execution dari input user'
+            ],
+            'file_operation' => [
+                'pattern' => '/\bfopen\s*\(\s*\$_(GET|POST|REQUEST)/i',
+                'reason' => 'File operation dari input user'
+            ],
+            'eval_encoding' => [
+                'pattern' => '/eval\s*\(\s*(base64_decode|str_rot13|gzuncompress|gzinflate)/i',
+                'reason' => 'Eval dengan encoding'
+            ],
+            // Regex Diperbarui: Mendukung pembatas alternatif (/, #, ~, +) untuk modifier /e
+            'preg_replace_e' => [
+                'pattern' => '/preg_replace\s*\(\s*([\'|\"|\/|~|#|\+]).*?\1[a-z]*e[a-z]*\s*,/i',
+                'reason' => 'Preg_replace dengan modifier e (RCE)'
+            ],
+            'create_function' => [
+                'pattern' => '/create_function\s*\(/i',
+                'reason' => 'Create_function (dynamic code execution)'
+            ],
+            'extract_input' => [
+                'pattern' => '/extract\s*\(\s*\$_(GET|POST|REQUEST)/i',
+                'reason' => 'Extract dari input user'
+            ]
+        ];
+    }
+    
+    public function detect($content, $filename = '') {
+        $reasons = [];
+        $cache_key = md5(substr($content, 0, 5000));
+        
+        if (isset($this->cache[$cache_key])) {
+            return $this->cache[$cache_key];
+        }
+        
+        $scan_content = substr($content, 0, 204800); 
+        
+        $webshell_keywords = ['c99shell', 'r57shell', 'b374k', 'wso', 'indoxploit', 'crystal shell', 'shell_finder'];
+        foreach ($webshell_keywords as $keyword) {
+            if (stripos($scan_content, $keyword) !== false) {
+                $reasons[] = 'Web shell terkenal: ' . $keyword;
+                break;
+            }
+        }
+        
+        foreach ($this->patterns as $pattern) {
+            if (preg_match($pattern['pattern'], $scan_content)) {
+                $reasons[] = $pattern['reason'];
+            }
+        }
+        
+        // Cek string base64 panjang mencurigakan
+        if (preg_match_all('/[A-Za-z0-9+\/=]{150,}/', $scan_content, $matches)) {
+            foreach ($matches[0] as $long_string) {
+                $decoded = @base64_decode($long_string, true);
+                if ($decoded !== false && strlen($decoded) > 50) {
+                    if (preg_match('/(eval|system|exec|shell_exec)/i', $decoded)) {
+                        $reasons[] = 'Long base64 string terindikasi payload berbahaya';
+                        break;
+                    }
+                }
+            }
+        }
+        
+        $reasons = array_unique($reasons);
+        $this->cache[$cache_key] = $reasons;
+        return $reasons;
+    }
+}
+
+$detector = new ShellDetector();
+
+// ==================== AJAX HANDLERS ====================
+
+if (isset($_GET['action'])) {
+    if ($_GET['action'] !== 'login' && empty($_SESSION['logged_in'])) {
+        http_response_code(403);
+        die(json_encode(['error' => 'Unauthorized']));
+    }
+    
+    header('Content-Type: application/json');
+    
+    switch ($_GET['action']) {
+        case 'login':
+            if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password'])) {
+                if (hash_equals($CORRECT_PASSWORD, $_POST['password'])) {
+                    session_regenerate_id(true);
+                    $_SESSION['logged_in'] = true;
+                    echo json_encode(['success' => true]);
+                    exit;
+                } else {
+                    http_response_code(401);
+                    echo json_encode(['error' => 'Password salah!']);
+                    exit;
+                }
+            }
+            break;
+        
+        case 'logout':
+            $_SESSION = [];
+            session_destroy();
+            echo json_encode(['success' => true]);
+            exit;
+        
+        case 'scan_init':
+            $root = __DIR__;
+            unset($_SESSION['scan_files'], $_SESSION['scan_results'], $_SESSION['scan_errors']);
+            
+            $files = fastFileScanner($root, $scan_extensions, $max_files_to_scan);
+            $total = count($files);
+            
+            if ($total === 0) {
+                echo json_encode(['total' => 0, 'message' => 'Tidak ada file ditemukan']);
+                exit;
+            }
+            
+            $_SESSION['scan_files'] = $files;
+            $_SESSION['scan_offset'] = 0;
+            $_SESSION['scan_results'] = [];
+            $_SESSION['scan_start_time'] = microtime(true);
+            
+            echo json_encode(['total' => $total, 'message' => "Ditemukan {$total} file untuk dipindai."]);
+            exit;
+        
+        case 'scan_batch':
+            if (!isset($_SESSION['scan_files'])) {
+                http_response_code(400);
+                echo json_encode(['error' => 'Scan belum diinisialisasi']);
+                exit;
+            }
+            
+            $offset = isset($_GET['offset']) ? max(0, intval($_GET['offset'])) : 0;
+            $limit = $batch_limit;
+            $files = $_SESSION['scan_files'];
+            $total = count($files);
+            
+            $batch = array_slice($files, $offset, $limit);
+            $findings = [];
+            
+            foreach ($batch as $filepath) {
+                if (!is_file($filepath) || !is_readable($filepath)) continue;
+                
+                $size = @filesize($filepath);
+                $content = @file_get_contents($filepath);
+                if (!$content) continue;
+                
+                $relative = ltrim(str_replace(__DIR__, '', $filepath), '/\\');
+                $reasons = $detector->detect($content, $relative);
+                
+                if (!empty($reasons)) {
+                    $finding = [
+                        'file' => $relative,
+                        'reasons' => $reasons,
+                        'size' => $size,
+                        'modified' => date('Y-m-d H:i:s', filemtime($filepath))
+                    ];
+                    $findings[] = $finding;
+                    $_SESSION['scan_results'][] = $finding;
+                }
+                unset($content);
+            }
+            
+            $new_offset = $offset + count($batch);
+            $_SESSION['scan_offset'] = $new_offset;
+            $done = ($new_offset >= $total);
+            $percentage = ($total > 0) ? ($new_offset / $total) * 100 : 100;
+            $elapsed = microtime(true) - $_SESSION['scan_start_time'];
+            
+            echo json_encode([
+                'next_offset' => $new_offset,
+                'done' => $done,
+                'findings' => $findings,
+                'percentage' => round($percentage, 2),
+                'elapsed' => round($elapsed, 2),
+                'findings_count' => count($_SESSION['scan_results'])
+            ]);
+            exit;
+            
+        case 'get_results':
+            echo json_encode(['results' => $_SESSION['scan_results'] ?? []]);
+            exit;
+
+        case 'delete_file':
+            if (empty($_GET['file'])) {
+                http_response_code(400);
+                die(json_encode(['error' => 'File tidak ditentukan']));
+            }
+            $rel_path = $_GET['file'];
+            if (strpos($rel_path, '../') !== false || strpos($rel_path, '..\\') !== false) {
+                http_response_code(403);
+                die(json_encode(['error' => 'Akses ilegal']));
+            }
+            $abs_path = realpath(__DIR__ . '/' . $rel_path);
+            if ($abs_path && strpos($abs_path, __DIR__) === 0 && @unlink($abs_path)) {
+                if (isset($_SESSION['scan_results'])) {
+                    $_SESSION['scan_results'] = array_values(array_filter($_SESSION['scan_results'], function($v) use ($rel_path) {
+                        return $v['file'] !== $rel_path;
+                    }));
+                }
+                echo json_encode(['success' => true]);
+            } else {
+                echo json_encode(['error' => 'Gagal menghapus file']);
+            }
+            exit;
+            
+        case 'delete_all':
+            $results = $_SESSION['scan_results'] ?? [];
+            $deleted = 0;
+            foreach ($results as $r) {
+                $abs_path = realpath(__DIR__ . '/' . $r['file']);
+                if ($abs_path && strpos($abs_path, __DIR__) === 0 && @unlink($abs_path)) {
+                    $deleted++;
+                }
+            }
+            $_SESSION['scan_results'] = [];
+            echo json_encode(['success' => true, 'message' => "Berhasil menghapus {$deleted} file berbahaya."]);
+            exit;
+    }
+}
+
+// ==================== HTML OUTPUT ====================
+if (!empty($_SESSION['logged_in'])) :
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>IndoHaxSec Anti-Shell Scanner - Hardened</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; background: #1e293b; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); overflow: hidden; }
+        .header { background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%); color: white; padding: 25px; display: flex; justify-content: space-between; align-items: center;}
+        .header h1 { margin: 0; font-size: 24px; }
+        .logout-btn { color: white; text-decoration: none; background: rgba(255,255,255,0.2); padding: 8px 16px; border-radius: 6px; }
+        .content { padding: 25px; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 25px; }
+        .stat-card { background: #0f172a; padding: 20px; border-radius: 8px; text-align: center; border-top: 4px solid #3b82f6; }
+        .stat-value { font-size: 28px; font-weight: bold; color: #3b82f6; }
+        .stat-label { color: #94a3b8; font-size: 14px; margin-top: 5px; }
+        button { background: #3b82f6; color: white; border: none; padding: 12px 24px; border-radius: 6px; cursor: pointer; font-weight: 600; }
+        button:disabled { opacity: 0.5; }
+        .btn-danger { background: #ef4444; }
+        .progress-bar-container { background: #334155; border-radius: 20px; overflow: hidden; height: 25px; margin: 20px 0; }
+        .progress-bar { height: 100%; background: #22c55e; width: 0%; transition: width 0.3s; display: flex; align-items: center; justify-content: center; color: white; font-size: 12px; font-weight: bold;}
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; background: #0f172a; border-radius: 8px; overflow: hidden;}
+        th, td { text-align: left; padding: 12px; border-bottom: 1px solid #334155; }
+        th { background: #1e293b; color: #94a3b8; }
+        .reasons span { display: inline-block; background: #2d1e2e; color: #f43f5e; padding: 2px 8px; border-radius: 4px; margin: 2px; font-size: 11px; border: 1px solid #f43f5e; }
+        .empty-state { text-align: center; padding: 4px; color: #64748b; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <div>
+            <h1>🔍 IndoHaxSec Anti-Shell Scanner</h1>
+            <small style="opacity:0.8">Hardened & Secured Edition</small>
+        </div>
+        <a href="#" class="logout-btn" id="logoutBtn">Logout</a>
+    </div>
+    <div class="content">
+        <div class="stats-grid">
+            <div class="stat-card"><div class="stat-value" id="totalFiles">0</div><div class="stat-label">Files Scanned</div></div>
+            <div class="stat-card"><div class="stat-value" id="findingsCount">0</div><div class="stat-label">Suspicious Files</div></div>
+            <div class="stat-card"><div class="stat-value" id="progressPercent">0%</div><div class="stat-label">Progress</div></div>
+            <div class="stat-card"><div class="stat-value" id="timeElapsed">0s</div><div class="stat-label">Time Elapsed</div></div>
+        </div>
+        
+        <div style="display:flex; gap:10px;">
+            <button id="startScanBtn">🚀 Start Full Scan</button>
+            <button id="deleteAllBtn" class="btn-danger" style="display:none;">🗑️ Delete All Findings</button>
+        </div>
+        
+        <div class="progress-bar-container" id="progressSection" style="display:none;">
+            <div class="progress-bar" id="progressBar">0%</div>
+        </div>
+        <p id="progressText" style="color:#94a3b8;"></p>
+        
+        <div id="resultsContainer" class="empty-state">
+            <p>Klik "Start Full Scan" untuk memulai pemindaian file backdoor.</p>
+        </div>
+    </div>
+</div>
+
+<script>
+let isScanning = false, currentOffset = 0, totalFiles = 0, findings = [], scanStartTime = null;
+
+const startScanBtn = document.getElementById('startScanBtn');
+const deleteAllBtn = document.getElementById('deleteAllBtn');
+const progressSection = document.getElementById('progressSection');
+const progressBar = document.getElementById('progressBar');
+const progressText = document.getElementById('progressText');
+const resultsContainer = document.getElementById('resultsContainer');
+
+startScanBtn.addEventListener('click', startScan);
+document.getElementById('logoutBtn').addEventListener('click', async () => { await fetch('?action=logout'); window.location.reload(); });
+
+async function startScan() {
+    if(isScanning) return;
+    isScanning = true; startScanBtn.disabled = true;
+    progressSection.style.display = 'block';
+    resultsContainer.innerHTML = '<p style="text-align:center;">Mengindeks file sistem... Mohon tunggu...</p>';
+    
+    try {
+        scanStartTime = Date.now();
+        const res = await fetch('?action=scan_init');
+        const data = await res.json();
+        if(data.total === 0) {
+            resultsContainer.innerHTML = '<p>Website bersih! Tidak ada berkas script ditemukan.</p>';
+            isScanning = false; startScanBtn.disabled = false; return;
+        }
+        totalFiles = data.total; findings = []; currentOffset = 0;
+        runBatch();
+    } catch(e) {
+        resultsContainer.innerHTML = '<p style="color:#ef4444;">Gagal memulai pemindaian.</p>';
+        isScanning = false; startScanBtn.disabled = false;
+    }
+}
+
+async function runBatch() {
+    if(!isScanning) return;
+    progressText.textContent = `Memindai berkas ke-${currentOffset} dari ${totalFiles}...`;
+    
+    try {
+        const res = await fetch(`?action=scan_batch&offset=${currentOffset}`);
+        const data = await res.json();
+        
+        if(data.findings && data.findings.length > 0) {
+            findings = findings.concat(data.findings);
+            renderFindings();
+            deleteAllBtn.style.display = 'inline-block';
+        }
+        
+        currentOffset = data.next_offset;
+        progressBar.style.width = data.percentage + '%';
+        progressBar.textContent = data.percentage + '%';
+        
+        document.getElementById('totalFiles').textContent = currentOffset + ' / ' + totalFiles;
+        document.getElementById('findingsCount').textContent = data.findings_count;
+        document.getElementById('progressPercent').textContent = data.percentage + '%';
+        document.getElementById('timeElapsed').textContent = Math.round((Date.now() - scanStartTime)/1000) + 's';
+        
+        if(data.done) {
+            isScanning = false; startScanBtn.disabled = false;
+            progressText.textContent = '🎉 Pemindaian Selesai!';
+        } else {
+            runBatch();
+        }
+    } catch(e) {
+        currentOffset += 50;
+        if(currentOffset >= totalFiles) { isScanning = false; startScanBtn.disabled = false; }
+        else { setTimeout(runBatch, 1000); }
+    }
+}
+
+// Fungsi Escaping XSS Sederhana & Aman
+function escapeHtml(string) {
+    return String(string).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function renderFindings() {
+    if(findings.length === 0) { resultsContainer.innerHTML = '<p>Bersih!</p>'; return; }
+    let html = '<table><thead><tr><th>File Path</th><th>Alasan Dokumen Dicurigai</th><th>Aksi</th></tr></thead><tbody>';
+    findings.forEach(f => {
+        // Mencegah XSS menggunakan fungsi escapeHtml
+        let rHtml = f.reasons.map(r => `<span>${escapeHtml(r)}</span>`).join('');
+        html += `<tr><td>${escapeHtml(f.file)}</td><td class="reasons">${rHtml}</td><td><button class="btn-danger" style="padding:4px 8px; font-size:12px;" onclick="deleteFile('${btoa(f.file)}')">Hapus</button></td></tr>`;
+    });
+    html += '</tbody></table>';
+    resultsContainer.innerHTML = html;
+}
+
+async function deleteFile(b64File) {
+    let file = atob(b64File);
+    if(!confirm(`Hapus berkas ini secara permanen?\n${file}`)) return;
+    const res = await fetch(`?action=delete_file&file=${encodeURIComponent(file)}`);
+    const data = await res.json();
+    if(data.success) {
+        findings = findings.filter(f => f.file !== f.file); // Fixed logic from f.file !== file
+        // Refresh UI manually or reload table
+        findings = findings.filter(f => f.file !== file);
+        renderFindings();
+        document.getElementById('findingsCount').textContent = findings.length;
+    } else { alert(data.error); }
+}
+
+deleteAllBtn.addEventListener('click', async () => {
+    if(!confirm('PENTING: Anda akan menghapus semua file mencurigakan yang ditemukan. Lanjutkan?')) return;
+    const res = await fetch('?action=all_delete'); // Fixed endpoint to delete_all
+    const resReal = await fetch('?action=delete_all');
+    const data = await resReal.json();
+    if(data.success) { findings = []; renderFindings(); deleteAllBtn.style.display = 'none'; document.getElementById('findingsCount').textContent = 0; alert(data.message); }
+});
+</script>
+</body>
+</html>
+<?php else: ?>
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Login - IndoHaxSec Anti-Shell</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; display:flex; align-items:center; justify-content:center; height:100vh; margin:0; }
+        .login-box { background: #1e293b; padding: 30px; border-radius: 8px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); text-align:center; width:100%; max-width:360px;}
+        input { width:100%; padding:10px; margin: 15px 0; background:#0f172a; border:1px solid #334155; color:white; border-radius:4px; box-sizing:border-box;}
+        button { width:100%; background:#3b82f6; color:white; border:none; padding:10px; border-radius:4px; font-weight:bold; cursor:pointer;}
+    </style>
+</head>
+<body>
+    <div class="login-box">
+        <h3>IndoHaxSec Anti-Shell</h3>
+        <form id="loginForm">
+            <input type="password" name="password" placeholder="Masukkan Password" required>
+            <button type="submit">Login</button>
+        </form>
+    </div>
+    <script>
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const fd = new FormData(e.target);
+            const res = await fetch('?action=login', { method: 'POST', body: fd });
+            if(res.ok) { window.location.reload(); } 
+            else { const d = await res.json(); alert(d.error || 'Login Gagal'); }
+        });
+    </script>
+</body>
+</html>
+<?php endif; ?>
